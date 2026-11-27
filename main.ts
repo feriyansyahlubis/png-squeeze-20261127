@@ -619,6 +619,84 @@ let OPT_CAP4 = 512;    // 4-byte hash-chain walk cap (raised to 1024 for highly
 let OPT_CAP8 = 64;     // 8-byte hash-chain walk cap  compressible small inputs, see squeeze())
 const OPT_STOP_LEN = 258;
 
+function buildSA(data) {
+  const n = data.length;
+  const sa = new Int32Array(n);
+  const rank = new Int32Array(n);
+  const tmp = new Int32Array(n);
+  {
+    const cnt = new Int32Array(256);
+    for (let i = 0; i < n; i++) cnt[data[i]]++;
+    let s = 0;
+    for (let c = 0; c < 256; c++) { const t = cnt[c]; cnt[c] = s; s += t; }
+    for (let i = 0; i < n; i++) sa[cnt[data[i]]++] = i;
+  }
+  let r = 0;
+  rank[sa[0]] = 0;
+  for (let i = 1; i < n; i++) {
+    if (data[sa[i]] !== data[sa[i - 1]]) r++;
+    rank[sa[i]] = r;
+  }
+  const sa2 = new Int32Array(n);
+  for (let k = 1; r < n - 1; k <<= 1) {
+    const m = r + 2;
+    const cnt = new Int32Array(m);
+    for (let i = 0; i < n; i++) {
+      const j = sa[i];
+      cnt[j + k < n ? rank[j + k] + 1 : 0]++;
+    }
+    let s = 0;
+    for (let c = 0; c < m; c++) { const t = cnt[c]; cnt[c] = s; s += t; }
+    for (let i = 0; i < n; i++) {
+      const j = sa[i];
+      sa2[cnt[j + k < n ? rank[j + k] + 1 : 0]++] = j;
+    }
+    cnt.fill(0);
+    for (let i = 0; i < n; i++) cnt[rank[sa2[i]]]++;
+    s = 0;
+    for (let c = 0; c <= r; c++) { const t = cnt[c]; cnt[c] = s; s += t; }
+    for (let i = 0; i < n; i++) sa[cnt[rank[sa2[i]]]++] = sa2[i];
+    tmp[sa[0]] = 0;
+    r = 0;
+    for (let i = 1; i < n; i++) {
+      const a = sa[i], b = sa[i - 1];
+      if (rank[a] !== rank[b] || ((a + k < n ? rank[a + k] : -1) !== (b + k < n ? rank[b + k] : -1))) r++;
+      tmp[a] = r;
+    }
+    rank.set(tmp);
+  }
+  // Truncated doubling leaves duplicate ranks (suffixes sharing >=256-byte
+  // prefixes); recompute the true inverse SA for Kasai.
+  for (let i = 0; i < n; i++) rank[sa[i]] = i;
+  return { sa, rank };
+}
+
+function buildLCP(data, sa, rank) {
+  const n = data.length;
+  const lcp = new Int32Array(n);
+  let h = 0;
+  for (let i = 0; i < n; i++) {
+    const r = rank[i];
+    if (r === 0) { lcp[r] = 0; continue; }
+    const j = sa[r - 1];
+    while (h < 258 && i + h < n && j + h < n && data[i + h] === data[j + h]) h++;
+    lcp[r] = h;
+    if (h > 0) h--;
+  }
+  return lcp;
+}
+
+
+// Hybrid frontier: short hash-chain walk for NEAR matches (chain cap 32/8 —
+// the chain only needs the nearest occurrences) + suffix-array scan for LONG
+// matches (K=16 neighbours per direction, true LCP). The two are
+// complementary: chains find near matches fast, SA finds the longest match
+// at any distance. Pure SA scanning alone is much worse (it misses near
+// matches); pure chains miss long far matches.
+const HYB_CAP4 = 16;
+const HYB_CAP8 = 4;
+const HYB_SA_K = 16;
+
 function findMatches(data) {
   const n = data.length;
   const NF = FRONTIER_N;
@@ -639,13 +717,12 @@ function findMatches(data) {
       const pl = propLen - 1 <= maxLen ? propLen - 1 : maxLen;
       if (pl >= 3) { fLen[base] = pl; fDist[base] = propDist; fc = 1; }
     }
-    // ---- 4-byte chain ----
     if (i + 4 <= n) {
       const v4 = (data[i] << 24) ^ (data[i + 1] << 16) ^ (data[i + 2] << 8) ^ data[i + 3];
       const h4 = (Math.imul(v4, 2654435761) >>> HSHIFT) & (HSIZE - 1);
       let cand = head4[h4];
       let chain = 0;
-      while (cand !== -1 && chain < OPT_CAP4) {
+      while (cand !== -1 && chain < HYB_CAP4) {
         const dist = i - cand;
         if (dist > 32768) break;
         let t = 0;
@@ -658,32 +735,8 @@ function findMatches(data) {
             if (_a !== _b) break;
             l += 4;
           }
-          while (l + 4 <= maxLen) {
-          const _a = ((data[cand + l] << 24) | (data[cand + l + 1] << 16) | (data[cand + l + 2] << 8) | data[cand + l + 3]);
-          const _b = ((data[i + l] << 24) | (data[i + l + 1] << 16) | (data[i + l + 2] << 8) | data[i + l + 3]);
-          if (_a !== _b) break;
-          l += 4;
-        }
-        while (l < maxLen && data[cand + l] === data[i + l]) l++;
-          if (l >= 3) {
-            let dominated = false;
-            for (let k = 0; k < fc; k++) if (fLen[base + k] >= l && fDist[base + k] <= dist) { dominated = true; break; }
-            if (!dominated) {
-              let w = 0;
-              for (let k = 0; k < fc; k++) {
-                if (fLen[base + k] <= l && fDist[base + k] >= dist) continue;
-                fLen[base + w] = fLen[base + k]; fDist[base + w] = fDist[base + k]; w++;
-              }
-              fc = w;
-              if (fc < NF || l > fLen[base + fc - 1]) {
-                if (fc >= NF) fc--;
-                let at = fc;
-                while (at > 0 && fLen[base + at - 1] < l) at--;
-                for (let k = fc; k > at; k--) { fLen[base + k] = fLen[base + k - 1]; fDist[base + k] = fDist[base + k - 1]; }
-                fLen[base + at] = l; fDist[base + at] = dist; fc++;
-              }
-            }
-          }
+          while (l < maxLen && data[cand + l] === data[i + l]) l++;
+          if (l >= 3) fc = frontierAdd(fLen, fDist, base, fc, l, dist);
           if (l >= 258) break;
         }
         cand = prev4[cand];
@@ -693,14 +746,13 @@ function findMatches(data) {
       prev4[i] = head4[h4];
       head4[h4] = i;
     }
-    // ---- 8-byte chain: long matches at any distance ----
     if (i + 8 <= n) {
       let v8 = 0;
       for (let k = 0; k < 8; k++) v8 = (Math.imul(v8, 257) + data[i + k]) | 0;
       const h8 = (Math.imul(v8, 2654435761) >>> HSHIFT) & (HSIZE - 1);
       let cand = head8[h8];
       let chain = 0;
-      while (cand !== -1 && chain < OPT_CAP8) {
+      while (cand !== -1 && chain < HYB_CAP8) {
         const dist = i - cand;
         if (dist > 32768) break;
         let t = 0;
@@ -715,25 +767,7 @@ function findMatches(data) {
             l += 4;
           }
           while (l < maxLen && data[cand + l] === data[i + l]) l++;
-          if (l >= 8) {
-            let dominated = false;
-            for (let k = 0; k < fc; k++) if (fLen[base + k] >= l && fDist[base + k] <= dist) { dominated = true; break; }
-            if (!dominated) {
-              let w = 0;
-              for (let k = 0; k < fc; k++) {
-                if (fLen[base + k] <= l && fDist[base + k] >= dist) continue;
-                fLen[base + w] = fLen[base + k]; fDist[base + w] = fDist[base + k]; w++;
-              }
-              fc = w;
-              if (fc < NF || l > fLen[base + fc - 1]) {
-                if (fc >= NF) fc--;
-                let at = fc;
-                while (at > 0 && fLen[base + at - 1] < l) at--;
-                for (let k = fc; k > at; k--) { fLen[base + k] = fLen[base + k - 1]; fDist[base + k] = fDist[base + k - 1]; }
-                fLen[base + at] = l; fDist[base + at] = dist; fc++;
-              }
-            }
-          }
+          if (l >= 8) fc = frontierAdd(fLen, fDist, base, fc, l, dist);
           if (l >= 258) break;
         }
         cand = prev8[cand];
@@ -745,6 +779,44 @@ function findMatches(data) {
     }
     propLen = fc > 0 ? fLen[base] : 0;
     propDist = fc > 0 ? fDist[base] : 0;
+  }
+  // ---- suffix-array pass: add long matches the short chain walk misses ----
+  const { sa, rank } = buildSA(data);
+  const lcp = buildLCP(data, sa, rank);
+  for (let i = 0; i + 3 <= n; i++) {
+    const maxLen = Math.min(258, n - i);
+    const base = i * NF;
+    let fc = 0;
+    while (fc < NF && fLen[base + fc] >= 3) fc++;
+    const r = rank[i];
+    let minL = 258;
+    for (let k = r - 1, steps = 0; k >= 0 && steps < HYB_SA_K; k--, steps++) {
+      const v = lcp[k + 1];
+      if (v < minL) minL = v;
+      if (minL < 3) break;
+      const j = sa[k];
+      if (j < i) {
+        const d = i - j;
+        if (d <= 32768) {
+          const L = minL > maxLen ? maxLen : minL;
+          if (L >= 3) fc = frontierAdd(fLen, fDist, base, fc, L, d);
+        }
+      }
+    }
+    minL = 258;
+    for (let k = r + 1, steps = 0; k < n && steps < HYB_SA_K; k++, steps++) {
+      const v = lcp[k];
+      if (v < minL) minL = v;
+      if (minL < 3) break;
+      const j = sa[k];
+      if (j < i) {
+        const d = i - j;
+        if (d <= 32768) {
+          const L = minL > maxLen ? maxLen : minL;
+          if (L >= 3) fc = frontierAdd(fLen, fDist, base, fc, L, d);
+        }
+      }
+    }
   }
   return { fLen, fDist, NF };
 }
