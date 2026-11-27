@@ -26,9 +26,11 @@ including the colour of fully transparent pixels — in as few bytes as possible
    the best is kept by **brute force** (each trial compressed with the preceding
    32 KiB as dictionary), alongside the minimum-sum and fewest-distinct-pairs
    heuristics and the fixed filters.
-5. **Deflate** — the two best screened candidates are re-compressed at zlib
-   level 9 with several variants (memLevel 7/8/9, default/filtered strategy) and
-   the smallest stream wins. A **custom optimal-parse DEFLATE encoder** is then
+5. **Deflate** — the best screened candidate(s) are re-compressed at zlib
+   level 9 (large inputs: the single best candidate with five variants —
+   memLevel 7/8/9, default/filtered strategy; small inputs: the two best
+   candidates with the two memLevel-9 variants) and the smallest stream wins.
+   A **custom optimal-parse DEFLATE encoder** is then
    run on the winning candidate's filtered data and kept whenever it beats
    zlib-9. On small inputs (≤ 1 MiB of filtered data) it uses a Pareto-frontier
    matcher (up to 3 non-dominated (length, distance) pairs per position, from
@@ -48,7 +50,7 @@ including the colour of fully transparent pixels — in as few bytes as possible
 node main.ts   # reads $MAKEFUN_INPUT_DIR (default /input), writes $MAKEFUN_OUTPUT_DIR (default /output)
 ```
 
-One run answers all 8 instances (`<id>/image.png`) in ~50 s on one CPU,
+One run answers all 8 instances (`<id>/image.png`) in ~53 s on one CPU,
 inside the 60 s wall budget.
 
 ## Practice-set results
@@ -59,21 +61,23 @@ points = 1000 × (floor − bytes) / (floor − target)):
 
 | id | theme | bytes | scale | floor | target | points |
 |----|-------|------:|------:|------:|------:|-------:|
-| i001 | flat  | 12,106 | 13,547 | 27,094 | 6,773 | 737.64 |
+| i001 | flat  | 11,523 | 13,547 | 27,094 | 6,773 | 766.33 |
 | i002 | rich  | 51,391 | 55,063 | 110,126 | 27,531 | 711.12 |
-| i003 | alpha | 100,757 | 107,892 | 215,784 | 53,946 | 710.79 |
+| i003 | alpha | 100,043 | 107,892 | 215,784 | 53,946 | 715.20 |
 | i004 | grey  | 99,048 | 110,521 | 221,042 | 55,260 | 735.89 |
-| i005 | flat  | 15,709 | 18,669 | 37,338 | 9,334 | 772.42 |
+| i005 | flat  | 15,333 | 18,669 | 37,338 | 9,334 | 785.83 |
 | i006 | rich  | 171,294 | 185,295 | 370,590 | 92,647 | 717.04 |
 | i007 | alpha | 60,724 | 64,285 | 128,570 | 32,142 | 703.59 |
-| i008 | grey  | 23,871 | 26,807 | 53,614 | 13,403 | 739.68 |
+| i008 | grey  | 23,380 | 26,807 | 53,614 | 13,403 | 751.94 |
 
-**Total practice-set score: 728,500** (mean 728.5 points/instance) — below the
+**Total practice-set score: 735,800** (mean 735.8 points/instance) — below the
 scale compressor's size on all 8 instances, and well above the house baseline
 `fixed-paeth` (420,399 on the same set). The frontier optimal-parse DEFLATE
 stage lifts the four smallest images (i001, i004, i005, i008) well above the
 zlib-9-only result; the larger images keep the legacy optimal-parse result,
-which still beats zlib-9 on i003 and i006.
+which still beats zlib-9 on i003 and i006. Highly compressible small inputs
+(zlib best < 50 KiB) get a deeper hash-chain walk (cap 1024/128 instead of
+512/64), which is where a saved byte is worth most.
 
 ## License
 

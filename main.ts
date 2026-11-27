@@ -388,6 +388,10 @@ const FINAL_VARIANTS = [
   { level: 9, memLevel: 8, strategy: Z.Z_FILTERED },
   { level: 9, memLevel: 7, strategy: Z.Z_DEFAULT_STRATEGY },
 ];
+const FINAL_VARIANTS_SMALL = [
+  { level: 9, memLevel: 9, strategy: Z.Z_DEFAULT_STRATEGY },
+  { level: 9, memLevel: 9, strategy: Z.Z_FILTERED },
+];
 
 // ---------------------------------------------------------------- optimal-parse DEFLATE
 // A from-scratch DEFLATE encoder in the manner of zopfli: hash-chain longest-match
@@ -601,8 +605,8 @@ const FIXED_DIST = codesFromLens(FIXED_DIST_LEN);
 // the frontier (gate on the best length among pairs with distance <= the
 // candidate's distance).
 const FRONTIER_N = 3;
-const OPT_CAP4 = 512;    // 4-byte hash-chain walk cap
-const OPT_CAP8 = 64;     // 8-byte hash-chain walk cap
+let OPT_CAP4 = 512;    // 4-byte hash-chain walk cap (raised to 1024 for highly
+let OPT_CAP8 = 64;     // 8-byte hash-chain walk cap  compressible small inputs, see squeeze())
 const OPT_STOP_LEN = 258;
 
 function findMatches(data) {
@@ -1061,10 +1065,12 @@ function squeeze(rgba, width, height) {
     }
   }
   cands.sort((a, b) => a.bytes - b.bytes);
-  const short = cands.slice(0, 2);
+  const isLarge = cands[0].data.length > OPT_SMALL_BYTES;
+  const short = cands.slice(0, isLarge ? 1 : 2);
+  const variants = isLarge ? FINAL_VARIANTS : FINAL_VARIANTS_SMALL;
   let best = null;
   for (const cand of short) {
-    for (const variant of FINAL_VARIANTS) {
+    for (const variant of variants) {
       const zlib = deflateSync(cand.data, variant);
       const bytes = zlib.length + extraBytes(cand.form);
       if (best === null || bytes < best.bytes) {
@@ -1075,6 +1081,7 @@ function squeeze(rgba, width, height) {
   // Optimal-parse DEFLATE on the winning candidate's filtered data: the
   // frontier parser on small inputs, otherwise the fast legacy parser.
   const useFrontier = best.data.length <= OPT_SMALL_BYTES;
+  if (useFrontier) { if (best.bytes < 50000) { OPT_CAP4 = 1024; OPT_CAP8 = 128; } else { OPT_CAP4 = 512; OPT_CAP8 = 64; } }
   const opt = useFrontier ? optimalDeflate(best.data) : optimalDeflateLegacy(best.data);
   if (opt !== null) {
     const bytes = opt.length + extraBytes(best.form);
