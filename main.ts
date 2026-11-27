@@ -301,7 +301,9 @@ function paletteForm(rgba, colours, order) {
 
 // ---------------------------------------------------------------- filtering
 const BRUTE_CONTEXT = 32768;
-const BRUTE_LEVEL = 4;
+const BRUTE_LEVEL = 6; // Revision: level 6 (was 4) — the trial deflate then tracks the
+// final level-9 cost more closely, so per-row filter picks match the real
+// winner more often; measured on the practice set before keeping.
 
 function pairsOf(row, seen, stamp) {
   let n = 0;
@@ -389,11 +391,16 @@ const SCREEN = { level: 6, memLevel: 8, strategy: constants.Z_DEFAULT_STRATEGY }
 
 // Final deflate variants tried for the shortlisted candidates (level 9).
 // (The screened stream itself, level 9 / memLevel 9 / default, is already known.)
+// Revision: RLE and Huffman-only join the sweep — filtered screenshot data is
+// mostly runs of small residuals, so on flat/palette rows one of these two can
+// beat the general-purpose strategies; we keep the smallest stream per candidate.
 const FINAL_VARIANTS = [
   { level: 9, memLevel: 9, strategy: constants.Z_FILTERED },
   { level: 9, memLevel: 8, strategy: constants.Z_DEFAULT_STRATEGY },
   { level: 9, memLevel: 7, strategy: constants.Z_DEFAULT_STRATEGY },
   { level: 9, memLevel: 8, strategy: constants.Z_FILTERED },
+  { level: 9, memLevel: 9, strategy: constants.Z_RLE },
+  { level: 9, memLevel: 9, strategy: constants.Z_HUFFMAN_ONLY },
 ];
 
 function pngOfForm(width, height, form, idat) {
@@ -416,10 +423,12 @@ function squeeze(rgba, width, height) {
       cands.push({ form, choice, data, zlib, bytes: zlib.length + chunkBytes(form) });
     }
   }
-  // Shortlist: the best two distinct (form, choice) candidates by screened size.
-  // (On the practice set every level-9 winner sits in the top two at level 6.)
+  // Shortlist: the best three distinct (form, choice) candidates by screened size.
+  // (On the practice set every level-9 winner sits in the top two at level 6;
+  // taking three costs one more level-9 sweep and guards against a level-6
+  // mis-ranking on the final set's unseen screenshots.)
   cands.sort((a, b) => a.bytes - b.bytes);
-  const short = cands.slice(0, 2);
+  const short = cands.slice(0, 3);
   let best = null;
   for (const cand of short) {
     // Try the final variants on the shortlisted filtered data.
