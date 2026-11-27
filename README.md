@@ -42,7 +42,14 @@ including the colour of fully transparent pixels — in as few bytes as possible
    128). Both iterate Huffman length estimation over 2 global rounds plus 1
    warm-started per-block round, use
    length-limited Huffman codes capped at 15 bits and completed to Kraft = 1,
-   and emit dynamic/fixed blocks. A single zlib stream is written into one
+   and emit dynamic/fixed blocks. **Adaptive block splitting (zopfli-style)**
+   runs inside `bestOfBoth`: each of the 4 blocks is tested for a split at
+   1/16-token intervals (plus a recursive second pass on the sub-blocks)
+   using a token-frequency + header-bit estimate, and a block is split only
+   when the estimated gain clears 96 bits; the per-block refine then
+   re-parses each half with its own warm-start Huffman table, and the
+   smaller of the global / split streams wins. A single zlib stream is
+   written into one
    IDAT chunk with a hand-rolled CRC-32. The candidate screen ranks all
    candidates with a fast level-1 deflate and re-ranks the best five at
    level 6; the final zlib stage tries a single level-9 variant. The hybrid
@@ -74,17 +81,22 @@ points = 1000 × (floor − bytes) / (floor − target)):
 | id | theme | bytes | scale | floor | target | points |
 |----|-------|------:|------:|------:|------:|-------:|
 | i001 | flat  | 11,172 | 13,547 | 27,094 | 6,773 | 783.50 |
-| i002 | rich  | 50,402 | 55,063 | 110,126 | 27,531 | 723.10 |
-| i003 | alpha | 99,572 | 107,892 | 215,784 | 53,946 | 718.10 |
-| i004 | grey  | 97,432 | 110,521 | 221,042 | 55,260 | 745.60 |
+| i002 | rich  | 50,202 | 55,063 | 110,126 | 27,531 | 725.50 |
+| i003 | alpha | 98,621 | 107,892 | 215,784 | 53,946 | 724.00 |
+| i004 | grey  | 96,811 | 110,521 | 221,042 | 55,260 | 749.40 |
 | i005 | flat  | 15,019 | 18,669 | 37,338 | 9,334 | 797.00 |
-| i006 | rich  | 171,685 | 185,295 | 370,590 | 92,647 | 715.60 |
-| i007 | alpha | 60,379 | 64,285 | 128,570 | 32,142 | 707.20 |
+| i006 | rich  | 169,674 | 185,295 | 370,590 | 92,647 | 722.90 |
+| i007 | alpha | 59,826 | 64,285 | 128,570 | 32,142 | 712.90 |
 | i008 | grey  | 22,762 | 26,807 | 53,614 | 13,403 | 767.30 |
 
-**Total practice-set score: 744,700** (mean 744.7 points/instance) — below the
+**Total practice-set score: 747,800** (mean 747.8 points/instance) — below the
 scale compressor's size on all 8 instances, and well above the house baseline
-`fixed-paeth` (420,399 on the same set). The hybrid suffix-array matcher
+`fixed-paeth` (420,399 on the same set). Round 6 adds adaptive block
+splitting à la zopfli on top of the Round 5 hybrid matcher (744.7): splitting
+the four large images' blocks where the token statistics change lifts i002
++2.4, i003 +5.9, i004 +3.8, i006 +7.3 and i007 +5.7 points (i001, i005, i008
+unchanged), for +3.1 mean points at no extra wall time (~41 s on the dev VM,
+inside the grader's 60 s single-CPU budget). The hybrid suffix-array matcher
 lifts the four smallest images (i001, i004, i005, i008) well above the
 plain hash-chain result (727.2): i001 +47 points, i005 +50, i008 +40,
 i004 +4. The larger images keep the legacy + sparse-frontier result, which
@@ -95,7 +107,9 @@ single-CPU budget — a deeper walk (cap 1024/128, practice 735.8) scored
 lower than this hybrid and timed out on the grader, so this revision trades
 the deep walk for a structurally better matcher that is also faster. A
 suffix-array scan alone (no chains) scores far worse (~716) because it
-misses near matches; the hybrid is what makes the SA useful.
+misses near matches; the hybrid is what makes the SA useful. (Measured on
+the dev VM: 5982.4 summed points over the 8 instances, wall 41.0 s and
+41.4 s on two runs, byte-identical outputs.)
 
 ## License
 

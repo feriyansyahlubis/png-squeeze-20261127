@@ -1198,6 +1198,96 @@ function emitStream(data, allToks, bounds) {
 // (each block refines its own costs, warm-started from the global parse).
 // Return the smaller stream and its tokens. Global wins on homogeneous data,
 // per-block on varied data.
+// ---- zopfli-style adaptive block splitting (R5) ----
+// Estimate, from token frequencies, whether splitting a DEFLATE block at some
+// interior point saves bits (two Huffman tables instead of one). The estimate
+// uses the same token frequencies + header-bit model as the real emit, so it
+// is cheap and close to the true gain; a block is only split when the
+// estimated gain clears SPLIT_MIN_GAIN bits. The per-block refine then
+// re-parses each half with its own warm-start Huffman table, and bestOfBoth
+// keeps whichever stream (global / split per-block) is smaller.
+const SPLIT_MIN_GAIN = process.env.R5_SPLIT_MIN ? parseInt(process.env.R5_SPLIT_MIN) : 96; // bits
+function tokenFreqs(toks) {
+  const lit = new Float64Array(288);
+  const dist = new Float64Array(30);
+  for (const t of toks) {
+    if (t.lit !== undefined) lit[t.lit]++;
+    else { lit[LEN_SYM[t.len]]++; dist[DIST_SYM[t.dist]]++; }
+  }
+  lit[256]++;
+  topUp(lit, 0, 1);
+  topUp(dist, 0, 1);
+  return { lit, dist };
+}
+function tokensBits(toks, litLens, distLens) {
+  let bits = 0;
+  for (const t of toks) {
+    if (t.lit !== undefined) bits += litLens[t.lit];
+    else bits += litLens[LEN_SYM[t.len]] + LEN_EXT[t.len] + distLens[DIST_SYM[t.dist]] + DIST_EXT[t.dist];
+  }
+  bits += litLens[256];
+  return bits;
+}
+function headerBits(litLens, distLens) {
+  const maxLit = Math.max(257, lastNonZero(litLens, 257, 288) + 1);
+  const maxDist = Math.max(1, lastNonZero(distLens, 0, 30) + 1);
+  const hb = huffmanCodes(flattenLens(litLens, distLens, maxLit, maxDist), 7);
+  let maxL = 0;
+  for (let i = 0; i < hb.lens.length; i++) if (hb.lens[i] > maxL) maxL = hb.lens[i];
+  return 14 + 5 + 5 + 4 + maxL * 19 + countBits(hb.lens);
+}
+function lastNonZero(lens, from, to) {
+  for (let i = to - 1; i >= from; i--) if (lens[i] > 0) return i;
+  return from - 1;
+}
+function flattenLens(litLens, distLens, maxLit, maxDist) {
+  const out = [];
+  for (let i = 0; i < maxLit; i++) out.push(litLens[i]);
+  for (let i = 0; i < maxDist; i++) out.push(distLens[i]);
+  return out;
+}
+function countBits(lens) {
+  let s = 0;
+  for (let i = 0; i < lens.length; i++) if (lens[i] > 0) s += lens[i];
+  return s;
+}
+function estimateSplit(toks) {
+  const T = toks.length;
+  if (T < 4096) return null;
+  const all = tokenFreqs(toks);
+  const allLitH = huffmanCodes(all.lit, 15);
+  const allDistH = huffmanCodes(all.dist, 15);
+  const unsplit = tokensBits(toks, allLitH.lens, allDistH.lens) + headerBits(allLitH.lens, allDistH.lens);
+  const lLit = new Float64Array(288);
+  const lDist = new Float64Array(30);
+  lLit[256] = 1;
+  const rLit = all.lit.slice();
+  const rDist = all.dist.slice();
+  let bestGain = 0, bestPos = 0;
+  let dataPos = 0;
+  const step = Math.max(1, Math.floor(T / 16));
+  let nextCand = step;
+  for (let i = 0; i < T; i++) {
+    const t = toks[i];
+    const adv = t.lit !== undefined ? 1 : t.len;
+    dataPos += adv;
+    if (t.lit !== undefined) { lLit[t.lit]++; rLit[t.lit]--; }
+    else { lLit[LEN_SYM[t.len]]++; rLit[LEN_SYM[t.len]]--; lDist[DIST_SYM[t.dist]]++; rDist[DIST_SYM[t.dist]]--; }
+    if (i + 1 === nextCand && i + 1 < T) {
+      const ll = huffmanCodes(lLit, 15).lens;
+      const ld = huffmanCodes(lDist, 15).lens;
+      const rl = huffmanCodes(rLit, 15).lens;
+      const rd = huffmanCodes(rDist, 15).lens;
+      const leftBits = tokensBits(toks.slice(0, i + 1), ll, ld) + headerBits(ll, ld);
+      const rightBits = tokensBits(toks.slice(i + 1), rl, rd) + headerBits(rl, rd);
+      const gain = unsplit - (leftBits + rightBits);
+      if (gain > bestGain) { bestGain = gain; bestPos = dataPos; }
+      nextCand += step;
+    }
+  }
+  if (bestGain > SPLIT_MIN_GAIN) return { pos: bestPos, gainBits: bestGain };
+  return null;
+}
 function bestOfBoth(data, bounds, parseFn) {
   const pbRounds = process.env.R3_PBROUNDS ? parseInt(process.env.R3_PBROUNDS) : 1;
   let litLens = FIXED_LIT_LEN, distLens = FIXED_DIST_LEN;
@@ -1235,10 +1325,37 @@ function bestOfBoth(data, bounds, parseFn) {
   topUp(wDistFreq, 0, 1);
   const warmLit = huffmanCodes(wLitFreq, 15).lens;
   const warmDist = huffmanCodes(wDistFreq, 15).lens;
+  let pbBounds = bounds;
+  if (process.env.R5_SPLIT !== '0') {
+    // pass 1: split each block once; pass 2: try splitting the sub-blocks again
+    // (tokens for a sub-block = slice of the global block tokens at the split point)
+    const splitToksAt = (toks, pos) => {
+      let adv = 0, idx = 0;
+      while (idx < toks.length && adv < pos) { const t = toks[idx]; adv += t.lit !== undefined ? 1 : t.len; idx++; }
+      return [toks.slice(0, idx), toks.slice(idx)];
+    };
+    let work = bounds.map((bd, b) => ({ bd, toks: toksG[b] }));
+    let changed = false;
+    for (let pass = 0; pass < 2; pass++) {
+      const next = [];
+      for (const { bd, toks } of work) {
+        const [s0, e0] = bd;
+        const sp = estimateSplit(toks);
+        if (sp && s0 + sp.pos < e0) {
+          const [lt, rt] = splitToksAt(toks, sp.pos);
+          next.push({ bd: [s0, s0 + sp.pos], toks: lt }, { bd: [s0 + sp.pos, e0], toks: rt });
+          changed = true;
+          if (process.env.EXP_SPLIT_LOG) console.error('split pass' + pass + ' block [' + s0 + ',' + e0 + ') at +' + sp.pos + ' gain ' + sp.gainBits.toFixed(0) + ' bits');
+        } else next.push({ bd, toks });
+      }
+      work = next;
+    }
+    if (changed) pbBounds = work.map(w => w.bd);
+  }
   const toksP = [];
-  for (const [s, e] of bounds) toksP.push(refineBlock((c, fl) => parseFn(s, e, c, fl), pbRounds, warmLit, warmDist));
+  for (const [s, e] of pbBounds) toksP.push(refineBlock((c, fl) => parseFn(s, e, c, fl), pbRounds, warmLit, warmDist));
   const streamG = emitStream(data, toksG, bounds);
-  const streamP = emitStream(data, toksP, bounds);
+  const streamP = emitStream(data, toksP, pbBounds);
   if (process.env.EXP_B_COMPARE) console.error('bestOfBoth global=' + streamG.length + ' perblock=' + streamP.length);
   if (streamP.length < streamG.length) return { stream: streamP, toks: toksP, which: 'perblock' };
   return { stream: streamG, toks: toksG, which: 'global' };
