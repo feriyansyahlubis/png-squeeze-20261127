@@ -949,6 +949,106 @@ function findMatchesSparse(data, lenArr, distArr, walk) {
   return { fLen, fDist, NF };
 }
 
+// ---------------------------------------------------------------- rank-64 long matches (R6)
+// Prefix-doubling ranks stopped after the k=32 iteration: ranks then
+// distinguish suffixes by their first 64 bytes, so two positions with the
+// same rank are guaranteed to share a >=64-byte match. A single sweep keeps
+// the nearest two previous positions per rank, which finds FAR long matches
+// the hash-chain walk misses (a repeated 64-byte pattern whose 4-gram occurs
+// thousands of times exhausts the chain cap before the long match is
+// reached). The true length is always measured directly (never trusted from
+// the rank), so no corrupt token is possible. Much cheaper than a full
+// suffix array: 6 doubling iterations instead of ~17, and no LCP array.
+// Measured on large inputs: -290B i002, -154B i007 over the sparse frontier
+// alone, at ~0.5s per input — funded by the short reference parse above.
+function rank64(data) {
+  const n = data.length;
+  const sa = new Int32Array(n);
+  const rank = new Int32Array(n);
+  const tmp = new Int32Array(n);
+  const sa2 = new Int32Array(n);
+  const cnt = new Int32Array(n + 2);
+  {
+    cnt.fill(0, 0, 256);
+    for (let i = 0; i < n; i++) cnt[data[i]]++;
+    let s = 0;
+    for (let c = 0; c < 256; c++) { const t = cnt[c]; cnt[c] = s; s += t; }
+    for (let i = 0; i < n; i++) sa[cnt[data[i]]++] = i;
+  }
+  let r = 0;
+  rank[sa[0]] = 0;
+  for (let i = 1; i < n; i++) {
+    if (data[sa[i]] !== data[sa[i - 1]]) r++;
+    rank[sa[i]] = r;
+  }
+  for (let k = 1; k <= 32; k <<= 1) {
+    const m = r + 2;
+    cnt.fill(0, 0, m);
+    for (let i = 0; i < n; i++) {
+      const j = sa[i];
+      cnt[j + k < n ? rank[j + k] + 1 : 0]++;
+    }
+    let s = 0;
+    for (let c = 0; c < m; c++) { const t = cnt[c]; cnt[c] = s; s += t; }
+    for (let i = 0; i < n; i++) {
+      const j = sa[i];
+      sa2[cnt[j + k < n ? rank[j + k] + 1 : 0]++] = j;
+    }
+    cnt.fill(0, 0, r + 1);
+    for (let i = 0; i < n; i++) cnt[rank[sa2[i]]]++;
+    s = 0;
+    for (let c = 0; c <= r; c++) { const t = cnt[c]; cnt[c] = s; s += t; }
+    for (let i = 0; i < n; i++) sa[cnt[rank[sa2[i]]]++] = sa2[i];
+    tmp[sa[0]] = 0;
+    r = 0;
+    for (let i = 1; i < n; i++) {
+      const a = sa[i], b = sa[i - 1];
+      if (rank[a] !== rank[b] || ((a + k < n ? rank[a + k] : -1) !== (b + k < n ? rank[b + k] : -1))) r++;
+      tmp[a] = r;
+    }
+    rank.set(tmp);
+    if (r === n - 1) break;
+  }
+  return rank;
+}
+
+// Add the rank-64 long matches to the frontier at walk positions.
+function addRank64Matches(data, fLen, fDist, NF, walk) {
+  const n = data.length;
+  if (n < 64) return;
+  const rank = rank64(data);
+  let maxR = 0;
+  for (let i = 0; i < n; i++) if (rank[i] > maxR) maxR = rank[i];
+  const last1 = new Int32Array(maxR + 1).fill(-1);
+  const last2 = new Int32Array(maxR + 1).fill(-1);
+  for (let i = 0; i + 64 <= n; i++) {
+    const rk = rank[i];
+    const c1 = last1[rk], c2 = last2[rk];
+    last2[rk] = c1; last1[rk] = i;
+    if (!walk[i]) continue;
+    const maxLen = Math.min(258, n - i);
+    for (const cand of [c1, c2]) {
+      if (cand < 0) continue;
+      const dist = i - cand;
+      if (dist > 32768) continue;
+      let l = 64;
+      while (l + 4 <= maxLen) {
+        const a = ((data[cand + l] << 24) | (data[cand + l + 1] << 16) | (data[cand + l + 2] << 8) | data[cand + l + 3]);
+        const b = ((data[i + l] << 24) | (data[i + l + 1] << 16) | (data[i + l + 2] << 8) | data[i + l + 3]);
+        if (a !== b) break;
+        l += 4;
+      }
+      while (l < maxLen && data[cand + l] === data[i + l]) l++;
+      if (l >= 64) {
+        const base = i * NF;
+        let fc = 0;
+        while (fc < NF && fLen[base + fc] >= 3) fc++;
+        frontierAdd(fLen, fDist, base, fc, l, dist);
+      }
+    }
+  }
+}
+
 // Token-start mask from a parse (array of per-block token arrays): 1 at every
 // position a token starts (literals and matches alike).
 function tokenStarts(allToks, n) {
@@ -1026,9 +1126,22 @@ function parseBlock(data, fLen, fDist, NF, start, end, costs, fullLen) {
       const d = fDist[base + k];
       const bc = c + distBits[d];
       if (fullLen) {
-        for (const cl of LEN_TRIES[L]) {
-          const nc = bc + lenBits[cl];
-          if (nc < cost[i + cl]) { cost[i + cl] = nc; prev[i + cl] = i; tokLen[i + cl] = cl; tokDist[i + cl] = d; }
+        // R6: the longest (k === 0) pair also tries EVERY length 3..L, not just
+        // the base lengths: the landing position matters (a match ending one
+        // byte earlier can unlock a much better match next), and lengths
+        // inside one DEFLATE length symbol cost the same bits. Capped at
+        // L <= 128: longer matches are rare and the full range costs more
+        // than it saves there. Measured +3.1 mean at ~zero time cost.
+        if (k === 0 && L <= 128) {
+          for (let cl = L; cl >= 3; cl--) {
+            const nc = bc + lenBits[cl];
+            if (nc < cost[i + cl]) { cost[i + cl] = nc; prev[i + cl] = i; tokLen[i + cl] = cl; tokDist[i + cl] = d; }
+          }
+        } else {
+          for (const cl of LEN_TRIES[L]) {
+            const nc = bc + lenBits[cl];
+            if (nc < cost[i + cl]) { cost[i + cl] = nc; prev[i + cl] = i; tokLen[i + cl] = cl; tokDist[i + cl] = d; }
+          }
         }
       } else {
         const nc = bc + lenBits[L];
@@ -1472,7 +1585,14 @@ function optimalDeflateLegacyFull(data) {
   for (let round = 0; round < OPT_ROUNDS; round++) {
     const costs = costTables(litLens, distLens);
     allToks = [];
-    for (const [s, e] of bounds) allToks.push(parseBlockLegacy(data, lenArr, distArr, s, e, costs, round === OPT_ROUNDS - 1));
+    // R6: the reference parse is deliberately run WITHOUT full-length tries
+    // in its last round. Full-length tries make its tokens longer, so its
+    // token starts land at fewer/different positions — and the sparse
+    // frontier only deep-walks at those starts, so it misses valuable
+    // matches. The short parse's token starts cover more useful positions
+    // (measured: -213B i002, -154B i003, -1275B i007; +386B i006 — net
+    // clearly positive) and it also saves ~1s per large input.
+    for (const [s, e] of bounds) allToks.push(parseBlockLegacy(data, lenArr, distArr, s, e, costs, false));
     if (round + 1 >= OPT_ROUNDS) break;
     const litFreq = new Float64Array(288);
     const distFreq = new Float64Array(30);
@@ -1549,6 +1669,7 @@ function squeeze(rgba, width, height) {
     if (leg !== null) {
       const walk = tokenStarts(leg.toks, best.data.length);
       const { fLen, fDist, NF } = findMatchesSparse(best.data, leg.lenArr, leg.distArr, walk);
+      addRank64Matches(best.data, fLen, fDist, NF, walk);
       const mixed = optimalDeflateWith(best.data, fLen, fDist, NF);
       if (mixed !== null && mixed.length < leg.stream.length) opt = mixed;
       else opt = leg.stream;

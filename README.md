@@ -56,10 +56,23 @@ including the colour of fully transparent pixels — in as few bytes as possible
    matcher (short chain cap 16/4 + SA scan of 16 neighbours per direction)
    replaces the plain hash-chain walk on small inputs: a pure SA scan alone
    misses near matches and scores far worse, and a pure chain walk misses
-   long far matches — together they beat either alone. The run stays ~41 s
+   long far matches — together they beat either alone. The run stays ~40 s
    on the dev VM and inside the grader's 60 s single-CPU budget (Round 3 at
    cap 1024/128 was rejected for timeout on the grader despite taking ~53 s
    on the dev VM).
+   Three further structural changes (Round 7): (a) in the DP's last round,
+   the longest frontier pair also tries **every** match length 3..L (not just
+   the DEFLATE base lengths) when L ≤ 128 — the landing position matters,
+   and lengths inside one length symbol cost the same bits (+3.1 mean at
+   ~zero time cost); (b) the large-input reference parse runs **without**
+   full-length tries, so its token starts cover more useful positions for
+   the sparse frontier's deep walk, and it saves ~1 s per large input;
+   (c) **rank-64 long matches** on large inputs: prefix-doubling ranks
+   stopped after the k=32 iteration distinguish suffixes by their first 64
+   bytes, so a sweep keeping the nearest two previous positions per rank
+   finds far ≥64-byte matches the hash-chain walk misses (true lengths
+   always measured directly, never trusted from the rank), at ~0.5 s per
+   large input.
 6. **Deterministic** — no clock, no randomness, fixed iteration order; two runs
    produce byte-identical outputs (verified with sha256).
 
@@ -69,8 +82,8 @@ including the colour of fully transparent pixels — in as few bytes as possible
 node main.ts   # reads $MAKEFUN_INPUT_DIR (default /input), writes $MAKEFUN_OUTPUT_DIR (default /output)
 ```
 
-One run answers all 8 instances (`<id>/image.png`) in ~41 s on the dev VM
-(~52 s projected on the grader's single CPU), inside the 60 s wall budget.
+One run answers all 8 instances (`<id>/image.png`) in ~40 s on the dev VM
+(~51 s projected on the grader's single CPU), inside the 60 s wall budget.
 
 ## Practice-set results
 
@@ -80,18 +93,23 @@ points = 1000 × (floor − bytes) / (floor − target)):
 
 | id | theme | bytes | scale | floor | target | points |
 |----|-------|------:|------:|------:|------:|-------:|
-| i001 | flat  | 11,172 | 13,547 | 27,094 | 6,773 | 783.50 |
-| i002 | rich  | 50,202 | 55,063 | 110,126 | 27,531 | 725.50 |
-| i003 | alpha | 98,621 | 107,892 | 215,784 | 53,946 | 724.00 |
-| i004 | grey  | 96,811 | 110,521 | 221,042 | 55,260 | 749.40 |
-| i005 | flat  | 15,019 | 18,669 | 37,338 | 9,334 | 797.00 |
-| i006 | rich  | 169,674 | 185,295 | 370,590 | 92,647 | 722.90 |
-| i007 | alpha | 59,826 | 64,285 | 128,570 | 32,142 | 712.90 |
-| i008 | grey  | 22,762 | 26,807 | 53,614 | 13,403 | 767.30 |
+| i001 | flat  | 11,101 | 13,547 | 27,094 | 6,773 | 787.00 |
+| i002 | rich  | 49,340 | 55,063 | 110,126 | 27,531 | 736.00 |
+| i003 | alpha | 97,925 | 107,892 | 215,784 | 53,946 | 728.30 |
+| i004 | grey  | 96,559 | 110,521 | 221,042 | 55,260 | 750.90 |
+| i005 | flat  | 14,886 | 18,669 | 37,338 | 9,334 | 801.70 |
+| i006 | rich  | 169,528 | 185,295 | 370,590 | 92,647 | 723.40 |
+| i007 | alpha | 58,000 | 64,285 | 128,570 | 32,142 | 731.80 |
+| i008 | grey  | 22,632 | 26,807 | 53,614 | 13,403 | 770.50 |
 
-**Total practice-set score: 747,800** (mean 747.8 points/instance) — below the
+**Total practice-set score: 753,700** (mean 753.7 points/instance) — below the
 scale compressor's size on all 8 instances, and well above the house baseline
-`fixed-paeth` (420,399 on the same set). Round 6 adds adaptive block
+`fixed-paeth` (420,399 on the same set). Round 7 adds three structural
+changes on top of the Round 6 block splitting (747.8): all-lengths DP for
+the longest frontier pair (+3.1 mean), a short reference parse plus rank-64
+long matches on the large inputs (i002 +10.4, i003 +4.3, i007 +18.9 points;
+i006 +0.5), for +5.9 mean at 2.2 s *less* wall time (~40 s on the dev VM,
+inside the grader's 60 s single-CPU budget). Round 6 adds adaptive block
 splitting à la zopfli on top of the Round 5 hybrid matcher (744.7): splitting
 the four large images' blocks where the token statistics change lifts i002
 +2.4, i003 +5.9, i004 +3.8, i006 +7.3 and i007 +5.7 points (i001, i005, i008
@@ -108,8 +126,8 @@ lower than this hybrid and timed out on the grader, so this revision trades
 the deep walk for a structurally better matcher that is also faster. A
 suffix-array scan alone (no chains) scores far worse (~716) because it
 misses near matches; the hybrid is what makes the SA useful. (Measured on
-the dev VM: 5982.4 summed points over the 8 instances, wall 41.0 s and
-41.4 s on two runs, byte-identical outputs.)
+the dev VM: 6029.6 summed points over the 8 instances, wall 39.8 s, two runs
+byte-identical.)
 
 ## License
 
