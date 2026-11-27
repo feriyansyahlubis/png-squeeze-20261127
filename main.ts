@@ -7,8 +7,9 @@
 // tRNS key forms); per-row filter choice by brute force (trial deflate) plus min-sum
 // and fewest-pairs heuristics plus fixed filters; screen the candidates with zlib
 // level 6 and shortlist the best three; final zlib level 9 variants; then a custom
-// optimal-parsing DEFLATE encoder (hash-chain matcher + shortest-path DP with
-// iterated Huffman lengths, fixed block splitting) on the best candidate, keeping
+// optimal-parsing DEFLATE encoder (Pareto-frontier hash-chain matcher +
+// shortest-path DP with iterated Huffman lengths, 4 blocks) on the best
+// candidate when the input is small enough and the time budget allows, keeping
 // whichever stream is smallest. One IDAT chunk, hand-rolled CRC-32.
 // Fully deterministic: no clock, no randomness, fixed iteration order.
 
@@ -588,42 +589,132 @@ const FIXED_LIT = codesFromLens(FIXED_LIT_LEN);
 const FIXED_DIST = codesFromLens(FIXED_DIST_LEN);
 
 // ---------------------------------------------------------------- longest matches
-const MAX_CHAIN = 128;   // hash-chain walk cap
-const GOOD_LEN = 32;     // stop the chain walk early past this match length
+// Pareto frontier per position (zopfli-style `sublen`): up to 3 (length,
+// distance) pairs that are not dominated (a pair dominates another when it is
+// both longer and nearer). The frontier captures the length/distance tradeoff
+// the DP needs, instead of a single best match. Two hash tables: 4-byte (long
+// matches at pattern starts) and 8-byte (long matches at any distance; buckets
+// are tiny because few positions share 8 bytes). Match propagation: the
+// longest match at i-1 (length L, distance D) implies a match of length L-1
+// at distance D at position i, so positions inside a run start from a good
+// match without a deep walk. A candidate is measured only when it can improve
+// the frontier (gate on the best length among pairs with distance <= the
+// candidate's distance).
+const FRONTIER_N = 3;
+const OPT_CAP4 = 512;    // 4-byte hash-chain walk cap
+const OPT_CAP8 = 64;     // 8-byte hash-chain walk cap
+const OPT_STOP_LEN = 258;
 
-// Longest match (length, distance) starting at every position of `data`.
 function findMatches(data) {
   const n = data.length;
-  const lenArr = new Uint16Array(n);
-  const distArr = new Uint16Array(n);
-  const head = new Int32Array(65536).fill(-1);
-  const prev = new Int32Array(n);
+  const NF = FRONTIER_N;
+  const fLen = new Uint16Array(n * NF);
+  const fDist = new Uint16Array(n * NF);
+  const HSIZE = 1 << 17;
+  const HSHIFT = 32 - 17;
+  const head4 = new Int32Array(HSIZE).fill(-1);
+  const prev4 = new Int32Array(n);
+  const head8 = new Int32Array(HSIZE).fill(-1);
+  const prev8 = new Int32Array(n);
+  let propLen = 0, propDist = 0;
   for (let i = 0; i + 3 <= n; i++) {
-    const h = ((data[i] << 10) + (data[i + 1] << 5) + data[i + 2]) & 65535;
     const maxLen = Math.min(258, n - i);
-    let best = 0, bestDist = 0;
-    let cand = head[h];
-    let chain = 0;
-    while (cand !== -1 && chain < MAX_CHAIN) {
-      const dist = i - cand;
-      if (dist > 32768) break;
-      if (best < maxLen && data[cand + best] === data[i + best]) {
-        let l = 0;
-        while (l < maxLen && data[cand + l] === data[i + l]) l++;
-        if (l > best) {
-          best = l; bestDist = dist;
+    const base = i * NF;
+    let fc = 0;
+    if (propLen >= 4) {
+      const pl = propLen - 1 <= maxLen ? propLen - 1 : maxLen;
+      if (pl >= 3) { fLen[base] = pl; fDist[base] = propDist; fc = 1; }
+    }
+    // ---- 4-byte chain ----
+    if (i + 4 <= n) {
+      const v4 = (data[i] << 24) ^ (data[i + 1] << 16) ^ (data[i + 2] << 8) ^ data[i + 3];
+      const h4 = (Math.imul(v4, 2654435761) >>> HSHIFT) & (HSIZE - 1);
+      let cand = head4[h4];
+      let chain = 0;
+      while (cand !== -1 && chain < OPT_CAP4) {
+        const dist = i - cand;
+        if (dist > 32768) break;
+        let t = 0;
+        for (let k = 0; k < fc; k++) if (fDist[base + k] <= dist && fLen[base + k] > t) t = fLen[base + k];
+        if (t < maxLen && data[cand + t] === data[i + t]) {
+          let l = 0;
+          while (l < maxLen && data[cand + l] === data[i + l]) l++;
+          if (l >= 3) {
+            let dominated = false;
+            for (let k = 0; k < fc; k++) if (fLen[base + k] >= l && fDist[base + k] <= dist) { dominated = true; break; }
+            if (!dominated) {
+              let w = 0;
+              for (let k = 0; k < fc; k++) {
+                if (fLen[base + k] <= l && fDist[base + k] >= dist) continue;
+                fLen[base + w] = fLen[base + k]; fDist[base + w] = fDist[base + k]; w++;
+              }
+              fc = w;
+              if (fc < NF || l > fLen[base + fc - 1]) {
+                if (fc >= NF) fc--;
+                let at = fc;
+                while (at > 0 && fLen[base + at - 1] < l) at--;
+                for (let k = fc; k > at; k--) { fLen[base + k] = fLen[base + k - 1]; fDist[base + k] = fDist[base + k - 1]; }
+                fLen[base + at] = l; fDist[base + at] = dist; fc++;
+              }
+            }
+          }
           if (l >= 258) break;
         }
+        cand = prev4[cand];
+        chain++;
+        if (fc > 0 && fLen[base] >= OPT_STOP_LEN && chain >= 32) break;
       }
-      cand = prev[cand];
-      chain++;
-      if (best >= GOOD_LEN && chain >= 16) break;
+      prev4[i] = head4[h4];
+      head4[h4] = i;
     }
-    if (best >= 3) { lenArr[i] = best; distArr[i] = bestDist; }
-    prev[i] = head[h];
-    head[h] = i;
+    // ---- 8-byte chain: long matches at any distance ----
+    if (i + 8 <= n) {
+      let v8 = 0;
+      for (let k = 0; k < 8; k++) v8 = (Math.imul(v8, 257) + data[i + k]) | 0;
+      const h8 = (Math.imul(v8, 2654435761) >>> HSHIFT) & (HSIZE - 1);
+      let cand = head8[h8];
+      let chain = 0;
+      while (cand !== -1 && chain < OPT_CAP8) {
+        const dist = i - cand;
+        if (dist > 32768) break;
+        let t = 0;
+        for (let k = 0; k < fc; k++) if (fDist[base + k] <= dist && fLen[base + k] > t) t = fLen[base + k];
+        if (t < 8) t = 8;
+        if (t < maxLen && data[cand + t] === data[i + t]) {
+          let l = 0;
+          while (l < maxLen && data[cand + l] === data[i + l]) l++;
+          if (l >= 8) {
+            let dominated = false;
+            for (let k = 0; k < fc; k++) if (fLen[base + k] >= l && fDist[base + k] <= dist) { dominated = true; break; }
+            if (!dominated) {
+              let w = 0;
+              for (let k = 0; k < fc; k++) {
+                if (fLen[base + k] <= l && fDist[base + k] >= dist) continue;
+                fLen[base + w] = fLen[base + k]; fDist[base + w] = fDist[base + k]; w++;
+              }
+              fc = w;
+              if (fc < NF || l > fLen[base + fc - 1]) {
+                if (fc >= NF) fc--;
+                let at = fc;
+                while (at > 0 && fLen[base + at - 1] < l) at--;
+                for (let k = fc; k > at; k--) { fLen[base + k] = fLen[base + k - 1]; fDist[base + k] = fDist[base + k - 1]; }
+                fLen[base + at] = l; fDist[base + at] = dist; fc++;
+              }
+            }
+          }
+          if (l >= 258) break;
+        }
+        cand = prev8[cand];
+        chain++;
+        if (fc > 0 && fLen[base] >= OPT_STOP_LEN && chain >= 16) break;
+      }
+      prev8[i] = head8[h8];
+      head8[h8] = i;
+    }
+    propLen = fc > 0 ? fLen[base] : 0;
+    propDist = fc > 0 ? fDist[base] : 0;
   }
-  return { lenArr, distArr };
+  return { fLen, fDist, NF };
 }
 
 // Bit costs for a parse, from literal/length and distance Huffman lengths.
@@ -637,9 +728,10 @@ function costTables(litLens, distLens) {
   return { litBits, lenBits, distBits };
 }
 
-// Shortest-path parse of data[start..end) with the given bit costs. Returns the
-// token list: {lit} literals and {len, dist} matches.
-function parseBlock(data, lenArr, distArr, start, end, costs) {
+// Shortest-path parse of data[start..end) with the given bit costs. Each
+// frontier pair is tried at its full length and at length 3 (a shorter use of
+// the same match can be cheaper once the Huffman lengths are fixed).
+function parseBlock(data, fLen, fDist, NF, start, end, costs) {
   const n = end - start;
   const { litBits, lenBits, distBits } = costs;
   const cost = new Float64Array(n + 1).fill(Infinity);
@@ -653,19 +745,20 @@ function parseBlock(data, lenArr, distArr, start, end, costs) {
     const pos = start + i;
     const ncLit = c + litBits[data[pos]];
     if (ncLit < cost[i + 1]) { cost[i + 1] = ncLit; prev[i + 1] = i; tokLen[i + 1] = 1; }
-    let L = lenArr[pos];
-    if (L >= 3) {
-      const rem = n - i;
+    const base = pos * NF;
+    const rem = n - i;
+    for (let k = 0; k < NF; k++) {
+      let L = fLen[base + k];
+      if (L < 3) continue;
       if (L > rem) L = rem;
-      const base = c + distBits[distArr[pos]];
-      const lo = Math.max(3, L - 3);
-      for (let cl = L; cl >= lo; cl--) {
-        const nc = base + lenBits[cl];
-        if (nc < cost[i + cl]) { cost[i + cl] = nc; prev[i + cl] = i; tokLen[i + cl] = cl; tokDist[i + cl] = distArr[pos]; }
-      }
-      if (lo > 3) {
-        const nc = base + lenBits[3];
-        if (nc < cost[i + 3]) { cost[i + 3] = nc; prev[i + 3] = i; tokLen[i + 3] = 3; tokDist[i + 3] = distArr[pos]; }
+      if (L < 3) continue;
+      const d = fDist[base + k];
+      const bc = c + distBits[d];
+      const nc = bc + lenBits[L];
+      if (nc < cost[i + L]) { cost[i + L] = nc; prev[i + L] = i; tokLen[i + L] = L; tokDist[i + L] = d; }
+      if (L > 3) {
+        const nc3 = bc + lenBits[3];
+        if (nc3 < cost[i + 3]) { cost[i + 3] = nc3; prev[i + 3] = i; tokLen[i + 3] = 3; tokDist[i + 3] = d; }
       }
     }
   }
@@ -773,7 +866,7 @@ function emitBlock(w, toks, isLast) {
   }
 }
 
-const OPT_MAX_BLOCKS = 8;  // split inputs over 1 MiB into at most this many blocks
+const OPT_BLOCKS = 4;      // split the input into this many blocks
 const OPT_ROUNDS = 5;      // DP rounds: fixed costs, then refined rounds (2 rounds overshoot: round-1 costs skew match-heavy)
 
 // Optimal-parse DEFLATE of `data`, wrapped as a zlib stream. Returns the stream
@@ -781,8 +874,8 @@ const OPT_ROUNDS = 5;      // DP rounds: fixed costs, then refined rounds (2 rou
 function optimalDeflate(data) {
   const n = data.length;
   if (n === 0) return null;
-  const { lenArr, distArr } = findMatches(data);
-  const nBlocks = n > 1048576 ? OPT_MAX_BLOCKS : 1;
+  const { fLen, fDist, NF } = findMatches(data);
+  const nBlocks = OPT_BLOCKS;
   const blockLen = Math.ceil(n / nBlocks);
   const bounds = [];
   for (let s = 0; s < n; s += blockLen) bounds.push([s, Math.min(n, s + blockLen)]);
@@ -791,7 +884,7 @@ function optimalDeflate(data) {
   for (let round = 0; round < OPT_ROUNDS; round++) {
     const costs = costTables(litLens, distLens);
     allToks = [];
-    for (const [s, e] of bounds) allToks.push(parseBlock(data, lenArr, distArr, s, e, costs));
+    for (const [s, e] of bounds) allToks.push(parseBlock(data, fLen, fDist, NF, s, e, costs));
     if (round + 1 >= OPT_ROUNDS) break;
     const litFreq = new Float64Array(288);
     const distFreq = new Float64Array(30);
@@ -822,7 +915,141 @@ function optimalDeflate(data) {
   return out;
 }
 
-// ---------------------------------------------------------------- squeeze one image
+// ---------------------------------------------------------------- legacy optimal-parse DEFLATE
+// The previous single-best-match optimal parser (3-byte hash, chain cap 128).
+// Kept as the fallback for large inputs, where the frontier parser above is
+// too slow: it is fast and still beats zlib level 9 on those inputs.
+const LEGACY_MAX_CHAIN = 128;
+const LEGACY_GOOD_LEN = 32;
+
+function findMatchesLegacy(data) {
+  const n = data.length;
+  const lenArr = new Uint16Array(n);
+  const distArr = new Uint16Array(n);
+  const head = new Int32Array(65536).fill(-1);
+  const prev = new Int32Array(n);
+  for (let i = 0; i + 3 <= n; i++) {
+    const h = ((data[i] << 10) + (data[i + 1] << 5) + data[i + 2]) & 65535;
+    const maxLen = Math.min(258, n - i);
+    let best = 0, bestDist = 0;
+    let cand = head[h];
+    let chain = 0;
+    while (cand !== -1 && chain < LEGACY_MAX_CHAIN) {
+      const dist = i - cand;
+      if (dist > 32768) break;
+      if (best < maxLen && data[cand + best] === data[i + best]) {
+        let l = 0;
+        while (l < maxLen && data[cand + l] === data[i + l]) l++;
+        if (l > best) {
+          best = l; bestDist = dist;
+          if (l >= 258) break;
+        }
+      }
+      cand = prev[cand];
+      chain++;
+      if (best >= LEGACY_GOOD_LEN && chain >= 16) break;
+    }
+    if (best >= 3) { lenArr[i] = best; distArr[i] = bestDist; }
+    prev[i] = head[h];
+    head[h] = i;
+  }
+  return { lenArr, distArr };
+}
+
+function parseBlockLegacy(data, lenArr, distArr, start, end, costs) {
+  const n = end - start;
+  const { litBits, lenBits, distBits } = costs;
+  const cost = new Float64Array(n + 1).fill(Infinity);
+  const prev = new Int32Array(n + 1).fill(-1);
+  const tokLen = new Int16Array(n + 1);
+  const tokDist = new Uint16Array(n + 1);
+  cost[0] = 0;
+  for (let i = 0; i < n; i++) {
+    const c = cost[i];
+    if (c === Infinity) continue;
+    const pos = start + i;
+    const ncLit = c + litBits[data[pos]];
+    if (ncLit < cost[i + 1]) { cost[i + 1] = ncLit; prev[i + 1] = i; tokLen[i + 1] = 1; }
+    let L = lenArr[pos];
+    if (L >= 3) {
+      const rem = n - i;
+      if (L > rem) L = rem;
+      const base = c + distBits[distArr[pos]];
+      const lo = Math.max(3, L - 3);
+      for (let cl = L; cl >= lo; cl--) {
+        const nc = base + lenBits[cl];
+        if (nc < cost[i + cl]) { cost[i + cl] = nc; prev[i + cl] = i; tokLen[i + cl] = cl; tokDist[i + cl] = distArr[pos]; }
+      }
+      if (lo > 3) {
+        const nc = base + lenBits[3];
+        if (nc < cost[i + 3]) { cost[i + 3] = nc; prev[i + 3] = i; tokLen[i + 3] = 3; tokDist[i + 3] = distArr[pos]; }
+      }
+    }
+  }
+  const toks = [];
+  let j = n;
+  while (j > 0) {
+    const p = prev[j];
+    const l = tokLen[j];
+    if (l === 1) toks.push({ lit: data[start + p] });
+    else toks.push({ len: l, dist: tokDist[j] });
+    j = p;
+  }
+  toks.reverse();
+  return toks;
+}
+
+function optimalDeflateLegacy(data) {
+  const n = data.length;
+  if (n === 0) return null;
+  const { lenArr, distArr } = findMatchesLegacy(data);
+  const nBlocks = n > 1048576 ? 8 : 1;
+  const blockLen = Math.ceil(n / nBlocks);
+  const bounds = [];
+  for (let s = 0; s < n; s += blockLen) bounds.push([s, Math.min(n, s + blockLen)]);
+  let litLens = FIXED_LIT_LEN, distLens = FIXED_DIST_LEN;
+  let allToks = null;
+  for (let round = 0; round < OPT_ROUNDS; round++) {
+    const costs = costTables(litLens, distLens);
+    allToks = [];
+    for (const [s, e] of bounds) allToks.push(parseBlockLegacy(data, lenArr, distArr, s, e, costs));
+    if (round + 1 >= OPT_ROUNDS) break;
+    const litFreq = new Float64Array(288);
+    const distFreq = new Float64Array(30);
+    for (const toks of allToks) {
+      for (const t of toks) {
+        if (t.lit !== undefined) litFreq[t.lit]++;
+        else { litFreq[LEN_SYM[t.len]]++; distFreq[DIST_SYM[t.dist]]++; }
+      }
+    }
+    litFreq[256]++;
+    topUp(litFreq, 0, 1);
+    topUp(distFreq, 0, 1);
+    const lh = huffmanCodes(litFreq, 15);
+    const dh = huffmanCodes(distFreq, 15);
+    litLens = lh.lens; distLens = dh.lens;
+  }
+  const w = new BitWriter(n);
+  for (let b = 0; b < bounds.length; b++) emitBlock(w, allToks[b], b === bounds.length - 1);
+  const raw = w.finish();
+  const out = new Uint8Array(raw.length + 6);
+  out[0] = 0x78; out[1] = 0x9c;
+  out.set(raw, 2);
+  const ad = adler32(data);
+  out[out.length - 4] = (ad >>> 24) & 255;
+  out[out.length - 3] = (ad >>> 16) & 255;
+  out[out.length - 2] = (ad >>> 8) & 255;
+  out[out.length - 1] = ad & 255;
+  return out;
+}
+
+// The frontier optimal-parse DEFLATE is slow on large inputs (its hash-chain
+// walk is the bottleneck). It runs only on small inputs (<= 1 MiB, the most
+// repetitive screenshots), where it pays best per second; everything else
+// uses the fast legacy optimal parser above. The choice is purely
+// size-based (never time-based) so the output is fully deterministic.
+const OPT_SMALL_BYTES = 1000000;
+
 function squeeze(rgba, width, height) {
   const forms = candidateForms(rgba);
   const cands = [];
@@ -845,8 +1072,10 @@ function squeeze(rgba, width, height) {
       }
     }
   }
-  // Optimal-parse DEFLATE on the winning candidate's filtered data.
-  const opt = optimalDeflate(best.data);
+  // Optimal-parse DEFLATE on the winning candidate's filtered data: the
+  // frontier parser on small inputs, otherwise the fast legacy parser.
+  const useFrontier = best.data.length <= OPT_SMALL_BYTES;
+  const opt = useFrontier ? optimalDeflate(best.data) : optimalDeflateLegacy(best.data);
   if (opt !== null) {
     const bytes = opt.length + extraBytes(best.form);
     if (bytes < best.bytes) best = { form: best.form, data: best.data, bytes, idat: opt };
